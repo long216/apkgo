@@ -141,7 +141,7 @@ stores:
 - Every field is optional; omitted fields keep the store's current value. `stores.<store>` overrides the defaults; an instance such as `script.cdn` inherits the `script` override.
 - Before any upload each target store's listing is validated (lengths, image format/size/bytes, screenshot count) and **all problems are reported at once** with exit code 3; `--dry-run` validates too.
 - Successful results list the submitted fields in `listing` (not for `already_done` results). pgyer and fir don't support listings — apkgo warns and uploads without it; `script` receives it as `Listing` in its stdin JSON.
-- To start from what the stores already have, `apkgo listing -p <package> --out ./listing` reads every store's current listing (read-only), saves the images under `./listing/assets` and writes `./listing/listing.yaml`, ready to edit and pass to `--listing`. Each store's values go under its own `stores:` entry with no shared defaults, so a store that can't be read is absent from the file and left unchanged on upload. OPPO, vivo and Huawei return all four fields. Honor returns the text, but its images are re-encoded previews that fail its own upload spec, so they are left out (the store keeps its originals). Tencent returns text only; Xiaomi has no query API. Existing text that wouldn't pass the store's spec is still written, with a warning in the output's `notes`.
+- To start from what the stores already have, `apkgo listing -p <package> --out ./listing` reads every store's current listing (read-only), saves the images under `./listing/assets` and writes `./listing/listing.yaml`, ready to edit and pass to `--listing`. Each store's values go under its own `stores:` entry with no shared defaults, so a store that can't be read is absent from the file and left unchanged on upload. OPPO, vivo and Huawei return all four fields. An image whose only problem is its format (OPPO may serve WEBP but takes only PNG/JPEG back) is converted to a format the store accepts. Honor may return reduced-size previews that fail its own upload spec; those are left out (the store keeps its originals). Tencent returns text only; Xiaomi has no query API. Existing text that wouldn't pass the store's spec is still written, with a warning in the output's `notes`.
 - Verification status: listing sync has been submitted end to end with real accounts on Huawei, Honor, OPPO, vivo, Xiaomi and Tencent. HarmonyOS, Meizu, Samsung and Google Play are implemented from the official docs but not yet verified against a real account — please open an [issue](https://github.com/KevinGong2013/apkgo/issues) if something is off.
 - `apkgo stores` prints each store's authoritative `listing` spec. Summary:
 
@@ -153,7 +153,7 @@ stores:
 | vivo | 5–16 CJK chars | 50–1000 | square PNG 256–512px, ≤500KB | 1080×1920, ≤2MB, 3–5 |
 | oppo | ≤13, no punctuation/spaces | ≥20 | PNG 512×512, ≤1MB | 1080×1920, ≤1MB, 2–5 |
 | xiaomi | ≤17 CJK chars, no trailing punctuation | — | PNG 512×512 | 1080×1920 or 1920×1080 (not mixed), ≤5MB, 3–5 |
-| meizu | — | 100–1000 | PNG/JPG | PNG/JPG |
+| meizu | — | 100–1000 | PNG/JPG | PNG/JPG, 16:9 at 720×1280, 1012×1800, 1080×1920 or 1440×2560 (either orientation), ≥3 |
 | samsung | ≤40 bytes | ≤4000 bytes | PNG 512×512, ≤1MB | 320–3840px, aspect ≤2:1, 4–8 |
 | tencent | 5–15 | 60–500 | PNG 512×512, ≤200KB | ≤1MB, same size, 4–5 |
 | googleplay | ≤80 | ≤4000 | PNG 512×512, ≤1MB | 320–3840px, aspect ≤2:1, 2–8 |
@@ -576,7 +576,7 @@ stores:
 apkgo doctor -s meizu -p com.example.app
 ```
 
-Uploads submit a new version of an app that is already listed — the first release (qualifications, ICP filing, screenshots) must be done in the Flyme console. Meizu accepts 64-bit packages only; a split-arch upload (`--file64`) sends the 64-bit APK. If the latest version was rejected (审核不通过), apkgo automatically resubmits through the fail-app update endpoint instead of the regular publish one.
+Uploads submit a new version of an app that is already listed — the first release (qualifications, ICP filing, screenshots) must be done in the Flyme console. Meizu accepts 64-bit packages only; a split-arch upload (`--file64`) sends the 64-bit APK. If the latest version was rejected (审核不通过), apkgo automatically resubmits through the fail-app update endpoint instead of the regular publish one. Every version needs an icon and screenshots: a missing icon is taken from the APK, but when Meizu has no screenshots on record for the app the upload stops before sending the APK — supply at least 3 with `--listing`, or add them in the console.
 
 #### Tencent App Store (YingYongBao)
 
