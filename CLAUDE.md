@@ -56,7 +56,7 @@ store reaches a terminal state (approved / rejected / withdrawn) or the global
 Only vivo currently declares `supports_sandbox`. It uses
 `sandbox_access_key` / `sandbox_access_secret` and vivo's isolated sandbox
 gateway; every other target is validated as a dry-run. Sandbox runs skip all
-global/per-store hooks, history, telemetry, and lifecycle event callbacks.
+global/per-store hooks, history, and lifecycle event callbacks.
 Results explicitly mark vivo with `sandbox: true` and other stores with
 `dry_run: true`.
 

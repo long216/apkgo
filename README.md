@@ -165,7 +165,7 @@ apkgo doctor -f demo-default-signed.app -s harmony    # 体检凭证 / 应用 ID
 
 `harmony` 商店走 AppGallery Connect 的 HarmonyOS Publishing API，**复用 huawei 的 Service Account 凭证**（同一个 AGC 账号同时覆盖安卓与鸿蒙应用），流程为：按 bundleName 查 appId（`packageTypes=7`）→ `upload-url/for-obs` 取签名上传地址 → PUT 上传 `.app` → 绑定软件包 → 等待编译解析 → 提交审核。只接受 **`.app` 整包**（AGC 不接受单个 `.hap` 模块）；`-f` 为鸿蒙包时会自动跳过安卓商店（不传 `-s` 时），显式指定安卓商店则直接报错。支持 `--release-time` 定时发布，不支持 `--file64` 与 URL 直传。
 
-`--sandbox` 与 `--dry-run` 互斥。目前只有 vivo 支持沙箱：vivo 会真实调用沙箱 API，其他目标渠道执行与 `--dry-run` 相同的本地校验。沙箱运行不执行 hooks、不写上传历史、不触发生命周期事件回调，也不上报上传遥测。结果顶层包含 `"sandbox": true`，vivo 结果包含 `"sandbox": true`，其他渠道包含 `"dry_run": true`。
+`--sandbox` 与 `--dry-run` 互斥。目前只有 vivo 支持沙箱：vivo 会真实调用沙箱 API，其他目标渠道执行与 `--dry-run` 相同的本地校验。沙箱运行不执行 hooks、不写上传历史、不触发生命周期事件回调。结果顶层包含 `"sandbox": true`，vivo 结果包含 `"sandbox": true`，其他渠道包含 `"dry_run": true`。
 
 vivo 的[沙箱环境](https://dev.vivo.com.cn/documentCenter/doc/327#s-l67kfh1m)与正式环境的应用数据、`access_key` 和密钥完全隔离；请按[在线测试环境说明](https://dev.vivo.com.cn/documentCenter/doc/327#s-b9qi52f4)先在沙箱创建应用并申请独立凭据。测试环境限制每个接口 100 次/天。
 
@@ -227,9 +227,6 @@ apkgo doctor -s huawei -f app.apk         # 从 APK 自动取包名
 `apkgo.yaml`:
 
 ```yaml
-# 可选：检查新版本的频率，如 "30d"、"7d"，"0" 关闭
-# update_check: "7d"
-
 # hooks 为可选配置，不需要可以不写
 hooks:
   before: "./scripts/validate.sh"          # 所有上传前执行
@@ -537,7 +534,6 @@ apkgo config export --out <file>
 apkgo config import <file>
 apkgo stores        [--configured] [-o json|text]
 apkgo history       [-n limit]
-apkgo upgrade
 apkgo version       [-o json|text]
 ```
 

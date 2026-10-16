@@ -15,7 +15,6 @@ import (
 	"github.com/KevinGong2013/apkgo/v4/pkg/history"
 	"github.com/KevinGong2013/apkgo/v4/pkg/httpx"
 	"github.com/KevinGong2013/apkgo/v4/pkg/store"
-	"github.com/KevinGong2013/apkgo/v4/pkg/telemetry"
 	"github.com/KevinGong2013/apkgo/v4/pkg/uploader"
 )
 
@@ -142,23 +141,11 @@ var uploadCmd = &cobra.Command{
 			})
 		}
 
-		// Persist locally and report anonymous telemetry — both are CLI
-		// behaviours; library callers do their own equivalents.
+		// Persist upload results locally for the history command.
 		if !result.DryRun && !result.Sandbox {
 			if err := history.Append(history.DefaultPath(), result.APK, result.Results); err != nil {
 				slog.Warn("failed to save history", "error", err)
 			}
-			storeResults := make([]telemetry.StoreResult, len(result.Results))
-			for i, r := range result.Results {
-				storeResults[i] = telemetry.StoreResult{Name: r.Store, Success: r.Success}
-			}
-			telemetry.Send(telemetry.Event{
-				Event:   "upload",
-				Source:  "cli",
-				Version: Version,
-				Package: result.APK.PackageName,
-				Stores:  storeResults,
-			})
 		}
 
 		// Exit code reflects how many stores failed.

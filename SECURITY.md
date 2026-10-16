@@ -45,7 +45,6 @@ We will credit reporters in the advisory unless you request otherwise.
 In scope:
 
 - The `apkgo` CLI (`cmd/apkgo`).
-- The telemetry server (`cmd/telemetry-server`).
 - Store adapters under `pkg/store/`.
 - Release artifacts published from this repository.
 
@@ -61,7 +60,7 @@ Out of scope:
 
 `apkgo` reads store credentials from local config or environment variables and
 forwards them only to the matching vendor API over TLS. Credentials are never
-logged, never sent to third parties, and never included in telemetry events.
+logged or sent to unrelated third parties.
 If you discover a code path that leaks credentials, please treat it as a
 high-severity finding and report it through the channels above.
 
@@ -107,7 +106,6 @@ high-severity finding and report it through the channels above.
 **在范围内:**
 
 - `apkgo` CLI(`cmd/apkgo`)。
-- 遥测服务(`cmd/telemetry-server`)。
 - `pkg/store/` 下的应用商店适配器。
 - 本仓库发布的二进制制品。
 
@@ -120,5 +118,5 @@ high-severity finding and report it through the channels above.
 ## 凭证处理说明
 
 `apkgo` 仅从本地配置或环境变量读取商店凭证,并通过 TLS 仅转发给对应厂商 API。
-凭证不会写入日志、不会发送给第三方、也不会包含在遥测事件中。如果你发现任何会泄露
-凭证的代码路径,请将其按高危问题通过上述渠道报告。
+凭证不会写入日志,只会通过 TLS 转发给对应厂商 API。如果你发现任何会泄露凭证的代码路径,
+请将其按高危问题通过上述渠道报告。

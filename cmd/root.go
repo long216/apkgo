@@ -12,8 +12,6 @@ import (
 
 	"github.com/KevinGong2013/apkgo/v4/pkg/config"
 	"github.com/KevinGong2013/apkgo/v4/pkg/httptrace"
-	"github.com/KevinGong2013/apkgo/v4/pkg/telemetry"
-	"github.com/KevinGong2013/apkgo/v4/pkg/update"
 )
 
 var (
@@ -59,11 +57,6 @@ var rootCmd = &cobra.Command{
 			cmd.SetContext(httptrace.WithRecorder(cmd.Context(), rec))
 		}
 
-		// Non-blocking update check (skipped for upgrade command itself)
-		if cmd.Name() != "upgrade" {
-			cfg := config.LoadOrEmpty(flagConfig)
-			update.CheckAndRemind(Version, cfg.UpdateCheckInterval(update.DefaultCheck))
-		}
 		return nil
 	},
 	SilenceUsage:  true,
@@ -85,9 +78,6 @@ func init() {
 
 // Execute runs the root command and returns an exit code.
 func Execute() int {
-	// main calls os.Exit right after this returns, which would kill any
-	// telemetry request still in flight.
-	defer telemetry.Flush(2 * time.Second)
 	defer func() {
 		if httpTrace != nil {
 			httpTrace.Close()

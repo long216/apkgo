@@ -8,8 +8,6 @@ description: Reference for configuring apkgo.yaml (all 12 stores + script), writ
 YAML file (`apkgo.yaml`, override with `-c`), environment variables (`APKGO_<STORE>_<KEY>`), or JSON piped in with `--creds-from stdin` / `--creds-from fd:N` (keeps secrets off disk; overrides `--config`). `apkgo stores` prints the live schema (`*` = required) — trust it over this list if they disagree.
 
 ```yaml
-update_check: "7d"   # optional; how often to check for a new apkgo release, "0" disables
-
 stores:
   huawei:
     service_account: ""        # recommended; raw JSON or base64
@@ -122,7 +120,7 @@ Without `--out` it just prints what each store reports as JSON.
 
 For vivo sandbox uploads, run `apkgo upload -f app.apk --sandbox`. vivo uses
 its separate sandbox credentials and endpoint; all other selected stores are
-dry-runs. `--sandbox` skips all hooks, history, telemetry, and lifecycle event
+dry-runs. `--sandbox` skips all hooks, history, and lifecycle event
 callbacks, and it cannot be combined with `--dry-run`.
 
 ## Hooks

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -23,9 +22,8 @@ type HookConfig struct {
 
 // Config is the top-level YAML configuration.
 type Config struct {
-	Hooks       HookConfig                   `yaml:"hooks,omitempty" json:"hooks,omitempty"`
-	Stores      map[string]map[string]string `yaml:"stores" json:"stores"`
-	UpdateCheck string                       `yaml:"update_check,omitempty" json:"update_check,omitempty"` // e.g. "30d", "7d", "0" to disable
+	Hooks  HookConfig                   `yaml:"hooks,omitempty" json:"hooks,omitempty"`
+	Stores map[string]map[string]string `yaml:"stores" json:"stores"`
 }
 
 // StoreWithHooks pairs a store instance with its configured registry name,
@@ -118,17 +116,6 @@ func wipe(b []byte) {
 	}
 }
 
-// LoadOrEmpty is like Load but returns an empty config instead of an error
-// when the file is missing. Used by callers that need best-effort access
-// to optional config (e.g. update-check intervals) without failing.
-func LoadOrEmpty(path string) *Config {
-	cfg, err := Load(path)
-	if err != nil {
-		return &Config{Stores: map[string]map[string]string{}}
-	}
-	return cfg
-}
-
 // Save writes the config to a YAML file.
 func (c *Config) Save(path string) error {
 	data, err := yaml.Marshal(c)
@@ -166,32 +153,6 @@ func mergeEnv(cfg *Config) {
 		}
 		cfg.Stores[storeName][fieldKey] = value
 	}
-}
-
-// UpdateCheckInterval parses the update_check field.
-// Returns 0 to disable, or the default (30 days) if not set.
-func (c *Config) UpdateCheckInterval(defaultInterval time.Duration) time.Duration {
-	s := strings.TrimSpace(c.UpdateCheck)
-	if s == "" {
-		return defaultInterval
-	}
-	if s == "0" || strings.EqualFold(s, "false") || strings.EqualFold(s, "off") {
-		return 0
-	}
-
-	// Support "30d", "7d", "1d"
-	if strings.HasSuffix(s, "d") {
-		if days, err := strconv.Atoi(s[:len(s)-1]); err == nil {
-			return time.Duration(days) * 24 * time.Hour
-		}
-	}
-
-	// Fallback to Go duration: "720h", "168h"
-	if d, err := time.ParseDuration(s); err == nil {
-		return d
-	}
-
-	return defaultInterval
 }
 
 // CreateStores instantiates Store implementations from config.

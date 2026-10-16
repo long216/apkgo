@@ -112,7 +112,7 @@ apkgo upload -f app-release.aab -s googleplay
 - `--release-time` is supported by huawei, harmony, honor, xiaomi, oppo, vivo, samsung and tencent; other stores release immediately.
 - File types: `.apk` goes to every Android store; `.aab` is googleplay-only; a HarmonyOS `.app` is harmony-only.
 
-`--sandbox` and `--dry-run` are mutually exclusive. vivo is currently the only sandbox-capable store: it makes real sandbox API calls, while every other target receives the same local validation as `--dry-run`. Sandbox runs skip all hooks, upload history, lifecycle event callbacks, and upload telemetry. The top-level result contains `"sandbox": true`; the vivo result contains `"sandbox": true`; other stores contain `"dry_run": true`.
+`--sandbox` and `--dry-run` are mutually exclusive. vivo is currently the only sandbox-capable store: it makes real sandbox API calls, while every other target receives the same local validation as `--dry-run`. Sandbox runs skip all hooks, upload history, and lifecycle event callbacks. The top-level result contains `"sandbox": true`; the vivo result contains `"sandbox": true`; other stores contain `"dry_run": true`.
 
 The vivo [sandbox environment](https://dev.vivo.com.cn/documentCenter/doc/327#s-l67kfh1m) has separate application data, `access_key`, and secrets from production. Follow the [online test environment instructions](https://dev.vivo.com.cn/documentCenter/doc/327#s-b9qi52f4) to create the application and request separate sandbox credentials first. Each sandbox API is limited to 100 calls per day.
 
@@ -235,9 +235,6 @@ Exit code is 1 if any probe fails. Every store except googleplay and script is s
 `apkgo.yaml`:
 
 ```yaml
-# Optional: how often to check for a new apkgo release, e.g. "30d", "7d"; "0" disables
-# update_check: "7d"
-
 # hooks are optional; omit if you don't need them
 hooks:
   before: "./scripts/validate.sh"          # runs before any upload
@@ -870,7 +867,6 @@ apkgo config export --out <file>
 apkgo config import <file>
 apkgo stores        [--configured] [-o json|text]
 apkgo history       [-n limit]
-apkgo upgrade
 apkgo version       [-o json|text]
 ```
 
