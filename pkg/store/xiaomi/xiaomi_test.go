@@ -1,6 +1,7 @@
 package xiaomi
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -17,9 +18,11 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/KevinGong2013/apkgo/v4/pkg/internal/offloadtest"
 	"github.com/KevinGong2013/apkgo/v4/pkg/progress"
 	"github.com/KevinGong2013/apkgo/v4/pkg/store"
 )
@@ -315,8 +318,8 @@ func TestUploadKeepsStoreAppName(t *testing.T) {
 	}
 }
 
-// copyFixtureAPK copies testdata/helloworld.apk into dir (extractIcon writes
-// its temp png next to the APK, so tests must not point it at testdata/).
+// copyFixtureAPK copies testdata/helloworld.apk into dir, so a test can see
+// what an upload leaves next to it.
 func copyFixtureAPK(t *testing.T, dir string) string {
 	t.Helper()
 	apkPath := filepath.Join(dir, "helloworld.apk")
@@ -336,11 +339,11 @@ func copyFixtureAPK(t *testing.T, dir string) string {
 // 48px variant, which replaced the console's HD icon with a blurry one.
 func TestExtractIconPicksDensestLauncherIcon(t *testing.T) {
 	apkPath := copyFixtureAPK(t, t.TempDir())
-	iconPath, err := extractIcon(apkPath)
+	iconPath, err := extractIcon(store.PackageFile{Path: apkPath})
 	if err != nil {
 		t.Fatalf("extractIcon: %v", err)
 	}
-	defer os.Remove(iconPath)
+	defer os.RemoveAll(filepath.Dir(iconPath))
 	f, err := os.Open(iconPath)
 	if err != nil {
 		t.Fatal(err)
@@ -352,6 +355,104 @@ func TestExtractIconPicksDensestLauncherIcon(t *testing.T) {
 	}
 	if cfg.Width != 192 || cfg.Height != 192 {
 		t.Errorf("extracted icon is %dx%d, want 192x192 (xxxhdpi)", cfg.Width, cfg.Height)
+	}
+}
+
+// spyReporter records the byte total push announces and the bytes then
+// reported as sent (Add runs on the request-writing goroutine).
+type spyReporter struct{ total, added atomic.Int64 }
+
+func (r *spyReporter) Phase(string)  {}
+func (r *spyReporter) Total(n int64) { r.total.Store(n) }
+func (r *spyReporter) Add(n int64)   { r.added.Add(n) }
+
+// TestUploadRemotePackage runs a 双包 upload end to end (query, launcher
+// icon, push) with the packages on disk, then the way a service that keeps
+// them in object storage does: paths that don't exist here, FileFacts and
+// an Offloader (offloadtest.Remote). /dev/push must get the same parts
+// under the same names, signed with the same md5s, and progress must count
+// exactly the bytes it announced.
+func TestUploadRemotePackage(t *testing.T) {
+	const queryResp = `{"result":0,"packageInfo":{"appName":"HelloWorld","packageName":"com.example.helloworld","versionCode":1,"versionName":"1.0"}}`
+	dir := t.TempDir()
+	apk32 := copyFixtureAPK(t, dir)
+	raw, err := os.ReadFile(apk32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apk64 := filepath.Join(dir, "helloworld-arm64.apk")
+	if err := os.WriteFile(apk64, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var localSigs []sigEntry
+	for _, remote := range []bool{false, true} {
+		srv, got := newPushServer(t, queryResp)
+		s, key := newTestStore(t, srv.URL)
+		s.client.SetBaseURL(srv.URL)
+		rep := &spyReporter{}
+		req := &store.UploadRequest{
+			PackageName: "com.example.helloworld",
+			VersionCode: 2,
+			FilePath:    apk32,
+			File64Path:  apk64,
+			Progress:    rep,
+		}
+		ctx := context.Background()
+		var off *offloadtest.Offloader
+		if remote {
+			req, ctx, off = offloadtest.Remote(t, ctx, req)
+		}
+		if res := s.Upload(ctx, req); !res.Success {
+			t.Fatalf("remote=%v: upload failed: %s", remote, res.Error)
+		}
+
+		wantParts := []string{"apk", "icon", "secondApk"}
+		if parts := got.fileFields(); !slices.Equal(parts, wantParts) {
+			t.Fatalf("remote=%v: multipart file parts = %v, want %v", remote, parts, wantParts)
+		}
+		for field, name := range map[string]string{"apk": "helloworld.apk", "secondApk": "helloworld-arm64.apk"} {
+			if p := got.part(t, field); !bytes.Equal(p.Body, raw) || p.FileName != name {
+				t.Errorf("remote=%v: %s = %d bytes as %q, want the %d-byte package as %q", remote, field, len(p.Body), p.FileName, len(raw), name)
+			}
+		}
+		icon := got.part(t, "icon")
+		if cfg, err := png.DecodeConfig(bytes.NewReader(icon.Body)); err != nil || cfg.Width != 192 || icon.FileName != "apkgo_icon_tmp.png" {
+			t.Errorf("remote=%v: icon part %q = %dx%d (err %v), want the 192px launcher icon as apkgo_icon_tmp.png", remote, icon.FileName, cfg.Width, cfg.Height, err)
+		}
+
+		// Each signed md5 matches the part sent under its name — and the
+		// remote run signs exactly what the local one did.
+		sigs := decryptSIGEntries(t, key, got.field("SIG"))
+		names := make([]string, 0, len(sigs))
+		for _, e := range sigs {
+			names = append(names, e.Name)
+		}
+		if want := []string{"RequestData", "apk", "secondApk", "icon"}; !slices.Equal(names, want) {
+			t.Fatalf("remote=%v: SIG sig list = %v, want %v", remote, names, want)
+		}
+		for _, e := range sigs[1:] {
+			if h := md5Of(got.part(t, e.Name).Body); e.Hash != h {
+				t.Errorf("remote=%v: sig %s hash = %s, uploaded part md5 = %s", remote, e.Name, e.Hash, h)
+			}
+		}
+		if !remote {
+			localSigs = sigs
+		} else if !slices.Equal(sigs, localSigs) {
+			t.Errorf("remote SIG list = %v, local = %v", sigs, localSigs)
+		}
+
+		var sent int64
+		for _, f := range wantParts {
+			sent += int64(len(got.part(t, f).Body))
+		}
+		if total, added := rep.total.Load(), rep.added.Load(); total != sent || added != sent {
+			t.Errorf("remote=%v: progress total %d, added %d, want both %d", remote, total, added, sent)
+		}
+
+		if remote && (!off.Sent(req.FilePath) || !off.Sent(req.File64Path)) {
+			t.Errorf("the packages did not go out as a transfer")
+		}
 	}
 }
 
@@ -368,5 +469,162 @@ func TestNewWithDefaultCert(t *testing.T) {
 	}
 	if s.pubKey.N.BitLen() != 1024 {
 		t.Errorf("got key size %d, want 1024", s.pubKey.N.BitLen())
+	}
+}
+
+// rateLimitServer answers /dev/query with -20035 for the first limited
+// calls and with the package after that, counting the calls.
+func rateLimitServer(t *testing.T, limited int32, calls *atomic.Int32) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/dev/query" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if calls.Add(1) <= limited {
+			_, _ = w.Write([]byte(`{"result":-20035,"message":"请求频率太快"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"result":0,"packageInfo":{"packageName":"com.example.helloworld","versionCode":1,"versionName":"1.0"}}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func shortRateLimitWaits(t *testing.T) {
+	t.Helper()
+	old := queryRateLimitWaits
+	queryRateLimitWaits = []time.Duration{time.Millisecond, time.Millisecond}
+	t.Cleanup(func() { queryRateLimitWaits = old })
+}
+
+// 2026-10-16: a /dev/query 54ms after another one for the same account got
+// -20035, and the upload failed with it. query waits and asks again.
+func TestQueryRetriesRateLimit(t *testing.T) {
+	shortRateLimitWaits(t)
+	var calls atomic.Int32
+	srv := rateLimitServer(t, 2, &calls)
+	s, _ := newTestStore(t, srv.URL)
+	s.client.SetBaseURL(srv.URL)
+
+	info, err := s.query(context.Background(), "com.example.helloworld")
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if info == nil || info.VersionCode != 1 {
+		t.Errorf("info = %+v, want versionCode 1", info)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Errorf("calls = %d, want 3 (two -20035, then the answer)", got)
+	}
+}
+
+// Still -20035 after every wait: the upload fails as store_busy, which
+// orchestrators retry minutes later, instead of unknown.
+func TestUploadRateLimitedIsStoreBusy(t *testing.T) {
+	shortRateLimitWaits(t)
+	var calls atomic.Int32
+	srv := rateLimitServer(t, 100, &calls)
+	s, _ := newTestStore(t, srv.URL)
+	s.client.SetBaseURL(srv.URL)
+
+	res := s.Upload(context.Background(), &store.UploadRequest{PackageName: "com.example.helloworld", VersionCode: 2})
+	if res.Success {
+		t.Fatal("upload succeeded, want failure")
+	}
+	if res.Category != store.CategoryStoreBusy {
+		t.Errorf("category = %q, want store_busy (error %q)", res.Category, res.Error)
+	}
+	if want := int32(len(queryRateLimitWaits) + 1); calls.Load() != want {
+		t.Errorf("calls = %d, want %d", calls.Load(), want)
+	}
+}
+
+// A wrong private key is auth_failed and asked once: waiting won't fix it.
+func TestQueryWrongPasswordIsAuthFailed(t *testing.T) {
+	shortRateLimitWaits(t)
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"result":-20014,"message":"密码错误"}`))
+	}))
+	defer srv.Close()
+	s, _ := newTestStore(t, srv.URL)
+	s.client.SetBaseURL(srv.URL)
+
+	_, err := s.query(context.Background(), "com.example.helloworld")
+	if got := store.CategoryOf(err); got != store.CategoryAuthFailed {
+		t.Errorf("category = %q, want auth_failed (error %v)", got, err)
+	}
+	if calls.Load() != 1 {
+		t.Errorf("calls = %d, want 1", calls.Load())
+	}
+}
+
+// The wait between retries gives up as soon as the context is done.
+func TestQueryRateLimitWaitHonoursContext(t *testing.T) {
+	old := queryRateLimitWaits
+	queryRateLimitWaits = []time.Duration{time.Hour}
+	t.Cleanup(func() { queryRateLimitWaits = old })
+	var calls atomic.Int32
+	srv := rateLimitServer(t, 100, &calls)
+	s, _ := newTestStore(t, srv.URL)
+	s.client.SetBaseURL(srv.URL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := s.query(ctx, "com.example.helloworld")
+	if store.CategoryOf(err) != store.CategoryStoreBusy {
+		t.Errorf("err = %v, want the -20035 (store_busy)", err)
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Errorf("query waited %s after the context was done", time.Since(start))
+	}
+}
+
+// TestDiagnoseChecksKeyWithoutPackage: with no package hint, diagnose must
+// still reach /dev/query — cert alone never talks to Xiaomi, and passing on
+// cert alone is how a wrong private key got saved as verified and only failed
+// at publish time with -20014 密码错误.
+func TestDiagnoseChecksKeyWithoutPackage(t *testing.T) {
+	for _, tc := range []struct {
+		name, resp, wantStatus string
+	}{
+		{"accepted", `{"result":0,"create":true}`, "ok"},
+		{"wrong key", `{"result":-20014,"message":"密码错误"}`, "fail"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPkg string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/dev/query" {
+					t.Errorf("unexpected path %s", r.URL.Path)
+				}
+				var reqData struct {
+					PackageName string `json:"packageName"`
+				}
+				_ = r.ParseForm()
+				_ = json.Unmarshal([]byte(r.FormValue("RequestData")), &reqData)
+				gotPkg = reqData.PackageName
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tc.resp))
+			}))
+			defer srv.Close()
+
+			s, _ := newTestStore(t, srv.URL)
+			s.client.SetBaseURL(srv.URL)
+			probes := s.diagnose(context.Background(), store.DiagnoseHint{})
+			if len(probes) != 2 || probes[1].Name != "query" {
+				t.Fatalf("probes = %+v, want cert + query", probes)
+			}
+			if probes[1].Status != tc.wantStatus {
+				t.Errorf("query status = %q (%+v), want %q", probes[1].Status, probes[1], tc.wantStatus)
+			}
+			if gotPkg != probePackage {
+				t.Errorf("queried package %q, want %q", gotPkg, probePackage)
+			}
+		})
 	}
 }

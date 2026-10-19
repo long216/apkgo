@@ -11,10 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
-	"errors"
 	"fmt"
-	"image"
-	_ "image/jpeg" // register jpeg decoder for icon extraction
 	"image/png"
 	"io"
 	"net/http"
@@ -25,12 +22,6 @@ import (
 	"time"
 
 	"github.com/go-resty/resty/v2"
-	"github.com/shogo82148/androidbinary"
-	"github.com/shogo82148/androidbinary/apk"
-	// Register decoder for webp icons. Modern Android builds (R8) often
-	// store app icons as webp; without this the std image package fails
-	// with "image: unknown format" when extracting the launcher icon.
-	_ "golang.org/x/image/webp"
 
 	"github.com/KevinGong2013/apkgo/v4/pkg/httptrace"
 	"github.com/KevinGong2013/apkgo/v4/pkg/httpx"
@@ -206,18 +197,51 @@ func (s *Store) upload(ctx context.Context, req *store.UploadRequest) error {
 		iconPath = req.Listing.Icon
 	} else {
 		rep.Phase("icon")
-		iconPath, err = extractIcon(req.FilePath)
+		iconPath, err = extractIcon(req.Package())
 		if err != nil {
 			return fmt.Errorf("extract icon: %w", err)
 		}
-		defer os.Remove(iconPath)
+		defer os.RemoveAll(filepath.Dir(iconPath))
 	}
 
 	// Push
 	return s.push(ctx, synchroType, req, iconPath, rep)
 }
 
+// resultRateLimited is xiaomi's 「请求频率太快」. Xiaomi documents neither the
+// limit nor what it counts (account or source address): 2026-10-16 a
+// /dev/query 54ms after another one for the same account got it, and the
+// upload failed with it in place of the real error.
+const resultRateLimited = -20035
+
+// queryRateLimitWaits are the pauses before query asks again after
+// -20035, one per retry. /dev/query only reads, so asking again is safe,
+// and a few seconds clears the near-simultaneous calls that trip the limit
+// (a preflight query right before the upload's, several jobs on one
+// account or one host). If it still says -20035 the error is store_busy and
+// the orchestrator retries the store minutes later. A var so tests can
+// shorten it.
+var queryRateLimitWaits = []time.Duration{2 * time.Second, 5 * time.Second}
+
+// query looks up the package on the account, retrying -20035 after
+// queryRateLimitWaits.
 func (s *Store) query(ctx context.Context, packageName string) (*packageInfo, error) {
+	for attempt := 0; ; attempt++ {
+		info, result, err := s.queryOnce(ctx, packageName)
+		if result != resultRateLimited || attempt >= len(queryRateLimitWaits) {
+			return info, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, err
+		case <-time.After(queryRateLimitWaits[attempt]):
+		}
+	}
+}
+
+// queryOnce sends one /dev/query and also returns xiaomi's result code
+// (0 when the request didn't get that far).
+func (s *Store) queryOnce(ctx context.Context, packageName string) (*packageInfo, int, error) {
 	body := s.encode(map[string]any{
 		"packageName": packageName,
 		"userName":    s.email,
@@ -236,10 +260,10 @@ func (s *Store) query(ctx context.Context, packageName string) (*packageInfo, er
 		SetResult(&resp).
 		Post("/dev/query")
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if httpResp.IsError() {
-		return nil, fmt.Errorf("http %d: %s", httpResp.StatusCode(), strings.TrimSpace(string(httpResp.Body())))
+		return nil, 0, fmt.Errorf("http %d: %s", httpResp.StatusCode(), strings.TrimSpace(string(httpResp.Body())))
 	}
 	if resp.Result != 0 {
 		msg := resp.Message
@@ -249,9 +273,10 @@ func (s *Store) query(ctx context.Context, packageName string) (*packageInfo, er
 		if msg == "" {
 			msg = strings.TrimSpace(string(httpResp.Body()))
 		}
-		return nil, fmt.Errorf("[%d] %s", resp.Result, msg)
+		return nil, resp.Result, store.Categorize(classifyXiaomi(resp.Result, msg),
+			fmt.Errorf("[%d] %s", resp.Result, msg))
 	}
-	return resp.PackageInfo, nil
+	return resp.PackageInfo, 0, nil
 }
 
 func (s *Store) push(ctx context.Context, synchroType int, req *store.UploadRequest, iconPath string, rep progress.Reporter) error {
@@ -287,11 +312,13 @@ func (s *Store) push(ctx context.Context, synchroType int, req *store.UploadRequ
 	// icon, screenshot_1..N) rather than letting map iteration shuffle it
 	// per run. The doc requires every uploaded file, screenshots included,
 	// to be signed.
-	files := []sigFile{{name: "apk", path: req.FilePath}}
-	if req.File64Path != "" {
-		files = append(files, sigFile{name: "secondApk", path: req.File64Path})
+	apkFile, apk64File := req.Package(), req.Package64()
+	iconFile := store.PackageFile{Path: iconPath}
+	files := []sigFile{{name: "apk", file: apkFile}}
+	if apk64File.Path != "" {
+		files = append(files, sigFile{name: "secondApk", file: apk64File})
 	}
-	files = append(files, sigFile{name: "icon", path: iconPath})
+	files = append(files, sigFile{name: "icon", file: iconFile})
 	files = append(files, shots...)
 
 	body := s.encode(map[string]any{
@@ -300,42 +327,32 @@ func (s *Store) push(ctx context.Context, synchroType int, req *store.UploadRequ
 		"appInfo":     appInfo,
 	}, files)
 
-	// Wrap every streamed file so the same reporter sees combined progress.
-	// Set Total once to the sum of all wrapped file sizes.
+	// Every part is sent from its path, so DoMultipart reports the bytes of
+	// all of them to the same reporter: set Total once to their sum.
 	rep.Phase("uploading")
-	apkRC, apkSize, err := progress.WrapFile(req.FilePath, rep)
+	apkSize, err := apkFile.Size()
 	if err != nil {
-		return fmt.Errorf("open apk: %w", err)
+		return fmt.Errorf("stat apk: %w", err)
 	}
-	defer apkRC.Close()
-
-	iconRC, iconSize, err := progress.WrapFile(iconPath, rep)
+	iconSize, err := iconFile.Size()
 	if err != nil {
-		return fmt.Errorf("open icon: %w", err)
+		return fmt.Errorf("stat icon: %w", err)
 	}
-	defer iconRC.Close()
-
-	var (
-		apk64RC   io.ReadCloser
-		apk64Size int64
-	)
-	if req.File64Path != "" {
-		apk64RC, apk64Size, err = progress.WrapFile(req.File64Path, rep)
-		if err != nil {
-			return fmt.Errorf("open apk64: %w", err)
+	var apk64Size int64
+	if apk64File.Path != "" {
+		if apk64Size, err = apk64File.Size(); err != nil {
+			return fmt.Errorf("stat apk64: %w", err)
 		}
-		defer apk64RC.Close()
 	}
 
 	shotParts := make([]httpx.FileField, 0, len(shots))
 	var shotsSize int64
 	for _, f := range shots {
-		rc, size, err := progress.WrapFile(f.path, rep)
+		size, err := f.file.Size()
 		if err != nil {
-			return fmt.Errorf("open %s: %w", f.name, err)
+			return fmt.Errorf("stat %s: %w", f.name, err)
 		}
-		defer rc.Close()
-		shotParts = append(shotParts, httpx.FileField{Field: f.name, FileName: filepath.Base(f.path), Reader: rc, Size: size})
+		shotParts = append(shotParts, httpx.FileField{Field: f.name, FileName: f.file.Name(), Path: f.file.Path, Size: size})
 		shotsSize += size
 	}
 	rep.Total(apkSize + iconSize + apk64Size + shotsSize)
@@ -345,20 +362,21 @@ func (s *Store) push(ctx context.Context, synchroType int, req *store.UploadRequ
 		fields[k] = body.Get(k)
 	}
 	parts := []httpx.FileField{
-		{Field: "apk", FileName: filepath.Base(req.FilePath), Reader: apkRC, Size: apkSize},
-		{Field: "icon", FileName: filepath.Base(iconPath), Reader: iconRC, Size: iconSize},
+		{Field: "apk", FileName: apkFile.Name(), Path: apkFile.Path, Size: apkSize},
+		{Field: "icon", FileName: iconFile.Name(), Path: iconFile.Path, Size: iconSize},
 	}
-	if apk64RC != nil {
-		parts = append(parts, httpx.FileField{Field: "secondApk", FileName: filepath.Base(req.File64Path), Reader: apk64RC, Size: apk64Size})
+	if apk64File.Path != "" {
+		parts = append(parts, httpx.FileField{Field: "secondApk", FileName: apk64File.Name(), Path: apk64File.Path, Size: apk64Size})
 	}
 	parts = append(parts, shotParts...)
 
 	pushResp, err := httpx.DoMultipart(ctx, httpx.MultipartRequest{
-		Method: http.MethodPost,
-		URL:    s.baseURL + "/dev/push",
-		Fields: fields,
-		Files:  parts,
-		Client: s.uploadClient,
+		Method:   http.MethodPost,
+		URL:      s.baseURL + "/dev/push",
+		Fields:   fields,
+		Files:    parts,
+		Progress: rep,
+		Client:   s.uploadClient,
 	})
 	if err != nil {
 		return err
@@ -392,15 +410,21 @@ func classifyXiaomi(result int, msg string) store.Category {
 		return store.CategoryPolicyBlock
 	case result == -7: // 应用归属关系异常
 		return store.CategoryConfigInvalid
+	case result == -20014: // 密码错误: private_key doesn't match the email
+		return store.CategoryAuthFailed
+	case result == resultRateLimited:
+		return store.CategoryStoreBusy
 	}
 	return store.CategoryUnknown
 }
 
 // sigFile is one uploaded part as it appears in the SIG hash list: the
-// multipart field name plus the local file whose md5 is signed.
+// multipart field name plus the file whose md5 is signed — a package, whose
+// md5 may be a given fact, or a local image (no facts: its md5 is read
+// from the file).
 type sigFile struct {
 	name string
-	path string
+	file store.PackageFile
 }
 
 // encode builds form values with RSA-encrypted SIG. files is signed in the
@@ -416,10 +440,10 @@ func (s *Store) encode(params map[string]any, files []sigFile) url.Values {
 	}}
 
 	for _, f := range files {
-		if f.path == "" {
+		if f.file.Path == "" {
 			continue
 		}
-		hash, err := fileMD5(f.path)
+		hash, err := f.file.MD5()
 		if err != nil {
 			continue
 		}
@@ -516,57 +540,27 @@ func md5hex(data []byte) string {
 	return fmt.Sprintf("%x", md5.Sum(data))
 }
 
-func fileMD5(path string) (string, error) {
-	f, err := os.Open(path)
+// extractIcon writes the package's launcher icon (PackageFile.LauncherIcon:
+// the densest one it ships, so the console's HD icon isn't overwritten
+// with the blurry 48px mdpi variant, #51) as a PNG into a new temp
+// directory and returns its path; the caller removes the directory. The
+// file keeps the name /dev/push has always been sent, apkgo_icon_tmp.png.
+func extractIcon(pf store.PackageFile) (string, error) {
+	icon, err := pf.LauncherIcon()
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
-	h := md5.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
-}
-
-// iconDensities lists the launcher-icon densities to request, densest
-// first. androidbinary resolves the icon resource for the requested
-// config: a zero density means mdpi and yields the 48px variant, which is
-// what used to overwrite the console's HD icon with a blurry one (#51).
-// 0xFFFE (anydpi) is deliberately not in the list — it resolves to the
-// adaptive-icon XML, which image.Decode can't read. Lower densities are
-// fallbacks for APKs that only ship an adaptive XML at the top end.
-var iconDensities = []uint16{640, 480, 320, 240, 160}
-
-func extractIcon(apkPath string) (string, error) {
-	pkg, err := apk.OpenFile(apkPath)
-	if err != nil {
-		return "", err
-	}
-	defer pkg.Close()
-
-	var (
-		icon image.Image
-		errs []error
-	)
-	for _, d := range iconDensities {
-		img, err := pkg.Icon(&androidbinary.ResTableConfig{Density: d})
-		if err == nil {
-			icon = img
-			break
-		}
-		errs = append(errs, fmt.Errorf("density %d: %w", d, err))
-	}
-	if icon == nil {
-		return "", errors.Join(errs...)
-	}
-
-	iconPath := filepath.Join(filepath.Dir(apkPath), "apkgo_icon_tmp.png")
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, icon); err != nil {
 		return "", err
 	}
+	dir, err := os.MkdirTemp("", "apkgo-xiaomi-icon-")
+	if err != nil {
+		return "", err
+	}
+	iconPath := filepath.Join(dir, "apkgo_icon_tmp.png")
 	if err := os.WriteFile(iconPath, buf.Bytes(), 0644); err != nil {
+		os.RemoveAll(dir)
 		return "", err
 	}
 	return iconPath, nil
@@ -579,32 +573,44 @@ type packageInfo struct {
 	VersionName string `json:"versionName"`
 }
 
+// probePackage is what diagnose queries when it has no package hint. Nobody
+// owns it, so /dev/query answers 「not uploaded」 (result 0, no packageInfo) —
+// but only after it has checked the SIG, which is the part that matters.
+const probePackage = "tech.baici.apkgo.doctorprobe"
+
 // diagnose is registered with `apkgo doctor`. It runs two layered probes:
 //
 //  1. cert  — public-key certificate is loadable, RSA, and not expired
 //  2. query — /dev/query accepts the SIG (proves email + private_key + cert
 //     all line up) and returns the stored package info if any
 //
-// Probe 2 needs a package-name hint and is reported as skipped without it,
-// since /dev/query requires `packageName`.
+// cert never leaves the process, so probe 2 is the only one that checks the
+// email / private_key pair. It always runs: without a package hint it queries
+// probePackage. (It used to be skipped, which let a wrong private key pass as
+// verified on cert alone and fail only at publish time with -20014 密码错误.)
 func diagnose(ctx context.Context, cfg map[string]string, hint store.DiagnoseHint) []store.Probe {
-	probes := make([]store.Probe, 0, 2)
-
 	s, err := New(cfg)
 	if err != nil {
-		probes = append(probes, store.Probe{Name: "cert", Status: "fail", Error: err.Error()})
-		return probes
+		return []store.Probe{{Name: "cert", Status: "fail", Error: err.Error()}}
 	}
+	return s.diagnose(ctx, hint)
+}
+
+func (s *Store) diagnose(ctx context.Context, hint store.DiagnoseHint) []store.Probe {
+	probes := make([]store.Probe, 0, 2)
 	probes = append(probes, store.Probe{Name: "cert", Status: "ok", Detail: fmt.Sprintf("RSA-%d public key loaded", s.pubKey.N.BitLen())})
 
-	if hint.Package == "" {
-		probes = append(probes, store.Probe{Name: "query", Status: "skip", Detail: "needs --package or --file"})
-		return probes
+	pkg := hint.Package
+	if pkg == "" {
+		pkg = probePackage
 	}
-
-	info, err := s.query(ctx, hint.Package)
+	info, err := s.query(ctx, pkg)
 	if err != nil {
 		probes = append(probes, store.Probe{Name: "query", Status: "fail", Error: err.Error()})
+		return probes
+	}
+	if hint.Package == "" {
+		probes = append(probes, store.Probe{Name: "query", Status: "ok", Detail: "email + private_key accepted (pass --package or --file to also look up an app)"})
 		return probes
 	}
 	detail := fmt.Sprintf("%s not yet uploaded under this account", hint.Package)

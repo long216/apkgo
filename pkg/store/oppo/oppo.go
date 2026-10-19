@@ -6,12 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -165,15 +164,13 @@ func New(cfg map[string]string) (*Store, error) {
 		return nil, fmt.Errorf("client_id and client_secret are required")
 	}
 
-	client := resty.New().
-		SetBaseURL("https://oop-openapi-cn.heytapmobi.com").
-		SetHeader("Content-Type", "application/json")
+	client := newAPIClient("https://oop-openapi-cn.heytapmobi.com")
 	trace := httptrace.ForStore("oppo", cfg)
 	trace.Client(client.GetClient())
 
 	token, err := fetchToken(client, clientID, clientSecret)
 	if err != nil {
-		return nil, store.Categorize(store.CategoryAuthFailed, fmt.Errorf("auth: %w", err))
+		return nil, store.AuthError(fmt.Errorf("auth: %w", err))
 	}
 
 	return &Store{
@@ -182,6 +179,39 @@ func New(cfg map[string]string) (*Store, error) {
 		accessToken:  token,
 		clientSecret: clientSecret,
 	}, nil
+}
+
+// apiRetryWait is the first pause before re-sending an idempotent call;
+// tests shorten it.
+var apiRetryWait = time.Second
+
+// newAPIClient is the client for OPPO's open API. OPPO's gateway now and
+// then answers 504 NoStackTraceTimeoutException after ~3 s, and
+// connections drop; calls that are safe to repeat are re-sent twice
+// before giving up (see retryIdempotent).
+func newAPIClient(baseURL string) *resty.Client {
+	return resty.New().
+		SetBaseURL(baseURL).
+		SetHeader("Content-Type", "application/json").
+		SetRetryCount(2).
+		SetRetryWaitTime(apiRetryWait).
+		SetRetryMaxWaitTime(3 * apiRetryWait).
+		AddRetryCondition(retryIdempotent)
+}
+
+// retryIdempotent re-sends a call that failed in transit or with a 5xx
+// only when repeating it is harmless: every GET (token, app info,
+// get-upload-url — each fetches a fresh one-time sign) and the task-state
+// query. The submit (POST app/upd) is never repeated, so a slow but
+// successful submit can't go in twice. With a condition set, resty
+// retries exactly when it says so.
+func retryIdempotent(r *resty.Response, err error) bool {
+	if r == nil || r.Request == nil {
+		return false
+	}
+	idempotent := r.Request.Method == http.MethodGet ||
+		strings.HasSuffix(r.Request.URL, "/resource/v1/app/task-state")
+	return idempotent && (err != nil || r.StatusCode() >= 500)
 }
 
 // fetchToken exchanges client_id+client_secret for an access token.
@@ -207,7 +237,7 @@ func fetchToken(client *resty.Client, clientID, clientSecret string) (string, er
 		return "", err
 	}
 	if httpResp.IsError() {
-		return "", fmt.Errorf("http %d: %s", httpResp.StatusCode(), strings.TrimSpace(string(httpResp.Body())))
+		return "", store.StatusError("", httpResp.StatusCode(), string(httpResp.Body()))
 	}
 	if resp.Errno != 0 || resp.Data.AccessToken == "" {
 		return "", fmt.Errorf("[%d] %s", resp.Errno, parseError(httpResp.Body()))
@@ -243,7 +273,8 @@ func (s *Store) upload(ctx context.Context, req *store.UploadRequest) error {
 
 	// Pre-declare the combined upload size so the bar is stable across
 	// apk and apk64 transfers.
-	totalBytes, err := sumFileSizes(req.FilePath, req.File64Path)
+	apkFile, apk64File := req.Package(), req.Package64()
+	totalBytes, err := store.TotalSize(apkFile, apk64File)
 	if err != nil {
 		return fmt.Errorf("stat apk: %w", err)
 	}
@@ -251,7 +282,7 @@ func (s *Store) upload(ctx context.Context, req *store.UploadRequest) error {
 	rep.Total(totalBytes)
 
 	// 2. Upload APK
-	uploadResult, err := s.uploadAPK(ctx, req.FilePath, rep)
+	uploadResult, err := s.uploadAPK(ctx, apkFile, rep)
 	if err != nil {
 		return fmt.Errorf("upload apk: %w", err)
 	}
@@ -260,7 +291,7 @@ func (s *Store) upload(ctx context.Context, req *store.UploadRequest) error {
 
 	if req.File64Path != "" {
 		apkInfos[0].CpuCode = 32
-		result64, err := s.uploadAPK(ctx, req.File64Path, rep)
+		result64, err := s.uploadAPK(ctx, apk64File, rep)
 		if err != nil {
 			return fmt.Errorf("upload 64-bit apk: %w", err)
 		}
@@ -283,7 +314,7 @@ func (s *Store) upload(ctx context.Context, req *store.UploadRequest) error {
 	// A listing icon was already validated against the same rule, so it
 	// replaces the stored one as is.
 	if req.Listing == nil || req.Listing.Icon == "" {
-		app.IconURL = s.compliantIconURL(ctx, app.IconURL, req.FilePath, rep)
+		app.IconURL = s.compliantIconURL(ctx, app.IconURL, apkFile, rep)
 	}
 
 	// 4. Publish. Two errno cases here are not real failures:
@@ -308,7 +339,7 @@ func (s *Store) upload(ctx context.Context, req *store.UploadRequest) error {
 		case isOppoTaskInFlight(err):
 			inFlight = true // fall through to polling
 		default:
-			return fmt.Errorf("publish: %w", err)
+			return fmt.Errorf("publish: %w", s.withAuditReason(ctx, req.PackageName, err))
 		}
 	}
 
@@ -340,21 +371,60 @@ func isOppoUnderReview(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "[911215]")
 }
 
-// sumFileSizes returns the total size in bytes of the given file paths.
-// Empty paths are ignored.
-func sumFileSizes(paths ...string) (int64, error) {
-	var total int64
-	for _, p := range paths {
-		if p == "" {
-			continue
-		}
-		fi, err := os.Stat(p)
-		if err != nil {
-			return 0, err
-		}
-		total += fi.Size()
+// apiError is a non-zero errno from OPPO's open API. Its text is the
+// "[errno] message" the store has always reported, which callers and
+// apkgo cloud's hints match on.
+type apiError struct {
+	Errno int
+	Msg   string
+}
+
+func (e *apiError) Error() string { return fmt.Sprintf("[%d] %s", e.Errno, e.Msg) }
+
+// auditLookupTimeout bounds withAuditReason's app/info query, so a slow
+// gateway can't hold up the publish error.
+const auditLookupTimeout = 15 * time.Second
+
+// withAuditReason adds OPPO's review verdict to a 911xxx publish error.
+// /app/upd's message for those can name a different cause than the real
+// one: on 2026-10-16 it answered "[911001] 版权证书无效" for an app OPPO
+// had rejected as a 马甲 of another app (APK 相似度 0.92), a reason only
+// app/info's refuse_reason gave. So when app/info shows the latest
+// version rejected, its status and reason are appended. 800xxx errors
+// (bad fields, token) are left alone: an earlier rejection says nothing
+// about them. If the query fails, err is returned as it was.
+func (s *Store) withAuditReason(ctx context.Context, pkgName string, err error) error {
+	var ae *apiError
+	if !errors.As(err, &ae) || ae.Errno/1000 != 911 {
+		return err
 	}
-	return total, nil
+	qctx, cancel := context.WithTimeout(ctx, auditLookupTimeout)
+	defer cancel()
+	app, qerr := s.queryApp(qctx, pkgName)
+	if qerr != nil {
+		ctxlog.FromContext(ctx).Warn("oppo app/info lookup for the publish error's review reason failed", "error", qerr)
+		return err
+	}
+	if app == nil {
+		return err
+	}
+	if state, _ := mapOppoAudit(app.AuditStatusName, app.RefuseReason); state != store.AuditRejected {
+		return err
+	}
+	status := app.AuditStatusName
+	if code := strings.TrimSpace(app.AuditStatus); code != "" {
+		status += "，audit_status=" + code
+	}
+	switch vn, vc := app.VersionName, strings.TrimSpace(app.VersionCode); {
+	case vn != "" && vc != "":
+		status += fmt.Sprintf("，版本 %s (%s)", vn, vc)
+	case vn+vc != "":
+		status += "，版本 " + vn + vc
+	}
+	if reason := strings.TrimSpace(app.RefuseReason); reason != "" {
+		return fmt.Errorf("%w；OPPO 后台审核结果：%s，驳回原因：%s", err, status, reason)
+	}
+	return fmt.Errorf("%w；OPPO 后台审核结果：%s", err, status)
 }
 
 func (s *Store) queryApp(ctx context.Context, pkgName string) (*appData, error) {
@@ -373,7 +443,7 @@ func (s *Store) queryApp(ctx context.Context, pkgName string) (*appData, error) 
 		return nil, err
 	}
 	if httpResp.IsError() {
-		return nil, fmt.Errorf("http %d: %s", httpResp.StatusCode(), strings.TrimSpace(string(httpResp.Body())))
+		return nil, store.StatusError("", httpResp.StatusCode(), string(httpResp.Body()))
 	}
 	if resp.Errno != 0 {
 		return nil, fmt.Errorf("[%d] %s", resp.Errno, parseError(httpResp.Body()))
@@ -390,14 +460,15 @@ func (s *Store) queryApp(ctx context.Context, pkgName string) (*appData, error) 
 	return &app, nil
 }
 
-func (s *Store) uploadAPK(ctx context.Context, filePath string, rep progress.Reporter) (*uploadResultData, error) {
-	return s.uploadFile(ctx, filePath, "apk", rep)
+func (s *Store) uploadAPK(ctx context.Context, apkFile store.PackageFile, rep progress.Reporter) (*uploadResultData, error) {
+	return s.uploadFile(ctx, apkFile, "apk", rep)
 }
 
 // uploadFile runs OPPO's two-step upload (get-upload-url → multipart POST) for
 // any file type. fileType is OPPO's discriminator: "apk", "photo" (images), or
 // "resource". The one-time sign is per-file, so each call fetches a fresh one.
-func (s *Store) uploadFile(ctx context.Context, filePath, fileType string, rep progress.Reporter) (*uploadResultData, error) {
+// file is the package, or a local image as PackageFile{Path: image}.
+func (s *Store) uploadFile(ctx context.Context, file store.PackageFile, fileType string, rep progress.Reporter) (*uploadResultData, error) {
 	// Get upload URL
 	var urlResp struct {
 		errEnvelope
@@ -415,18 +486,17 @@ func (s *Store) uploadFile(ctx context.Context, filePath, fileType string, rep p
 		return nil, fmt.Errorf("get-upload-url: %w", err)
 	}
 	if httpResp.IsError() {
-		return nil, fmt.Errorf("get-upload-url: http %d: %s", httpResp.StatusCode(), strings.TrimSpace(string(httpResp.Body())))
+		return nil, store.StatusError("get-upload-url: ", httpResp.StatusCode(), string(httpResp.Body()))
 	}
 	if urlResp.Errno != 0 || urlResp.Data.UploadURL == "" {
 		return nil, fmt.Errorf("get-upload-url: [%d] %s", urlResp.Errno, parseError(httpResp.Body()))
 	}
 
 	// Upload file (streamed, with progress reporting)
-	rc, fSize, err := progress.WrapFile(filePath, rep)
+	fSize, err := file.Size()
 	if err != nil {
-		return nil, fmt.Errorf("open file: %w", err)
+		return nil, fmt.Errorf("stat file: %w", err)
 	}
-	defer rc.Close()
 
 	var uploadResp struct {
 		errEnvelope
@@ -439,8 +509,9 @@ func (s *Store) uploadFile(ctx context.Context, filePath, fileType string, rep p
 			"sign": urlResp.Data.Sign,
 			"type": fileType,
 		},
-		Files:  []httpx.FileField{{Field: "file", FileName: filepath.Base(filePath), Reader: rc, Size: fSize}},
-		Client: s.uploadClient,
+		Files:    []httpx.FileField{{Field: "file", FileName: file.Name(), Path: file.Path, Size: fSize}},
+		Progress: rep,
+		Client:   s.uploadClient,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("upload: %w", err)
@@ -521,7 +592,7 @@ func (s *Store) publish(req *store.UploadRequest, app *appData, apkInfos []apkIn
 		return fmt.Errorf("http %d: %s", httpResp.StatusCode(), strings.TrimSpace(string(httpResp.Body())))
 	}
 	if resp.Errno != 0 {
-		return fmt.Errorf("[%d] %s", resp.Errno, parseError(httpResp.Body()))
+		return &apiError{Errno: resp.Errno, Msg: parseError(httpResp.Body())}
 	}
 	return nil
 }
@@ -588,7 +659,7 @@ func (s *Store) pollTaskState(ctx context.Context, pkgName, versionCode string) 
 			return err
 		}
 		if httpResp.IsError() {
-			return fmt.Errorf("http %d: %s", httpResp.StatusCode(), strings.TrimSpace(string(httpResp.Body())))
+			return store.StatusError("", httpResp.StatusCode(), string(httpResp.Body()))
 		}
 		// Surface envelope-level errors immediately. Without this, an
 		// auth/sign failure would loop silently for the full polling

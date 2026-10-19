@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"image"
 	"image/png"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -16,8 +17,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/go-resty/resty/v2"
 
 	"github.com/KevinGong2013/apkgo/v4/pkg/store"
 )
@@ -34,42 +33,91 @@ const (
 type fakeOppo struct {
 	srv *httptest.Server
 
-	updErrno  int    // errno /app/upd answers with
-	failPhoto bool   // photo uploads answer with an errno
-	taskState string // task_state /app/task-state answers with; "" = "2" (done)
-	// latest version /app/info reports and its review label
-	infoVersion, infoAudit string
+	updErrno   int    // errno /app/upd answers with
+	updMessage string // message /app/upd answers with; "" = "应用审核中"
+	failPhoto  bool   // photo uploads answer with an errno
+	taskState  string // task_state /app/task-state answers with; "" = "2" (done)
+	// latest version /app/info reports, its review label, status code and
+	// refuse_reason
+	infoVersion, infoAudit, infoAuditCode, infoRefuse string
+	// laterInfo is how app/info calls after the first (the upload's own
+	// query) fail: "errno" answers an errno, "504" keeps timing out;
+	// "" = they work.
+	laterInfo string
+	staleIcon bool // the stored icon is 256×256, which /app/upd rejects
+	// gateway504 makes a path answer 504 NoStackTraceTimeoutException this
+	// many times before it works, like OPPO's gateway does now and then.
+	gateway504 map[string]int
 
-	mu    sync.Mutex
-	calls []string // "info", "upload-url", "upload:<type>:<file>", "icon-check", "upd", "task-state"
-	upd   url.Values
+	mu      sync.Mutex
+	calls   []string // "info", "upload-url", "upload:<type>:<file>", "icon-check", "upd", "task-state"
+	infos   int      // app/info calls so far
+	upd     url.Values
+	uploads []upload // what /upload received, in order
+}
+
+// upload is a file the fake OPPO received.
+type upload struct {
+	typ, name string
+	data      []byte
 }
 
 func newFakeOppo(t *testing.T) *fakeOppo {
 	t.Helper()
-	old := taskPollInterval
-	taskPollInterval = time.Millisecond
-	t.Cleanup(func() { taskPollInterval = old })
+	old, oldWait := taskPollInterval, apiRetryWait
+	taskPollInterval, apiRetryWait = time.Millisecond, time.Millisecond
+	t.Cleanup(func() { taskPollInterval, apiRetryWait = old, oldWait })
 
-	f := &fakeOppo{}
-	var icon bytes.Buffer
+	f := &fakeOppo{gateway504: map[string]int{}}
+	var icon, staleIcon bytes.Buffer
 	if err := png.Encode(&icon, image.NewRGBA(image.Rect(0, 0, oppoIconSize, oppoIconSize))); err != nil {
+		t.Fatal(err)
+	}
+	if err := png.Encode(&staleIcon, image.NewRGBA(image.Rect(0, 0, 256, 256))); err != nil {
 		t.Fatal(err)
 	}
 
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		timeout := f.gateway504[r.URL.Path] > 0
+		if timeout {
+			f.gateway504[r.URL.Path]--
+		}
+		f.mu.Unlock()
+		if timeout {
+			f.record("504:" + r.URL.Path)
+			w.WriteHeader(http.StatusGatewayTimeout)
+			w.Write([]byte("NoStackTraceTimeoutException"))
+			return
+		}
 		switch r.URL.Path {
 		case "/resource/v1/app/info":
 			f.record("info")
+			f.mu.Lock()
+			f.infos++
+			later := f.infos > 1
+			f.mu.Unlock()
+			switch {
+			case later && f.laterInfo == "504":
+				w.WriteHeader(http.StatusGatewayTimeout)
+				w.Write([]byte("NoStackTraceTimeoutException"))
+				return
+			case later && f.laterInfo == "errno":
+				writeJSON(w, map[string]any{"errno": 500, "message": "系统繁忙", "data": []any{}})
+				return
+			}
 			writeJSON(w, map[string]any{"errno": 0, "data": map[string]any{
 				"app_name":    "Test App",
 				"summary":     oldSummary,
 				"detail_desc": oldDesc,
-				"icon_url":    f.srv.URL + "/old/icon.png", // compliant, so kept
+				"icon_url":    f.srv.URL + "/old/icon.png", // compliant unless staleIcon, so kept
 				"pic_url":     oldPicURL,
 
+				"version_name":      "1.1.0",
 				"version_code":      f.infoVersion,
+				"audit_status":      f.infoAuditCode,
 				"audit_status_name": f.infoAudit,
+				"refuse_reason":     f.infoRefuse,
 			}})
 		case "/resource/v1/upload/get-upload-url":
 			f.record("upload-url")
@@ -82,13 +130,21 @@ func newFakeOppo(t *testing.T) *fakeOppo {
 				t.Errorf("parse multipart: %v", err)
 				return
 			}
-			_, hdr, err := r.FormFile("file")
+			file, hdr, err := r.FormFile("file")
 			if err != nil {
 				t.Errorf("form file: %v", err)
 				return
 			}
+			data, err := io.ReadAll(file)
+			if err != nil {
+				t.Errorf("read form file: %v", err)
+				return
+			}
 			typ := r.FormValue("type")
 			f.record("upload:" + typ + ":" + hdr.Filename)
+			f.mu.Lock()
+			f.uploads = append(f.uploads, upload{typ: typ, name: hdr.Filename, data: data})
+			f.mu.Unlock()
 			if typ == "photo" && f.failPhoto {
 				writeJSON(w, map[string]any{"errno": 500, "message": "图片上传失败"})
 				return
@@ -99,6 +155,10 @@ func newFakeOppo(t *testing.T) *fakeOppo {
 		case "/old/icon.png":
 			f.record("icon-check")
 			w.Header().Set("Content-Type", "image/png")
+			if f.staleIcon {
+				w.Write(staleIcon.Bytes())
+				return
+			}
 			w.Write(icon.Bytes())
 		case "/resource/v1/app/upd":
 			if err := r.ParseForm(); err != nil {
@@ -108,7 +168,11 @@ func newFakeOppo(t *testing.T) *fakeOppo {
 			f.upd = r.PostForm
 			f.mu.Unlock()
 			f.record("upd")
-			writeJSON(w, map[string]any{"errno": f.updErrno, "message": "应用审核中"})
+			msg := f.updMessage
+			if msg == "" {
+				msg = "应用审核中"
+			}
+			writeJSON(w, map[string]any{"errno": f.updErrno, "message": msg})
 		case "/resource/v1/app/task-state":
 			f.record("task-state")
 			state := f.taskState
@@ -138,9 +202,16 @@ func (f *fakeOppo) seen() ([]string, url.Values) {
 	return slices.Clone(f.calls), f.upd
 }
 
+// received returns the files uploaded so far, in order.
+func (f *fakeOppo) received() []upload {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.uploads)
+}
+
 func (f *fakeOppo) store() *Store {
 	return &Store{
-		client:       resty.New().SetBaseURL(f.srv.URL),
+		client:       newAPIClient(f.srv.URL),
 		accessToken:  "test-token",
 		clientSecret: "test-secret",
 	}
